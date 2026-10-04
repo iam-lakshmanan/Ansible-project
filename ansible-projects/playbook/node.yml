@@ -1,0 +1,15 @@
+
+---
+- name: Install Node.js
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install Node.js
+      ansible.builtin.apt:
+        name: nodejs
+        state: present
