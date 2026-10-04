@@ -1,0 +1,18 @@
+---
+- name: Install Multiple Packages
+  hosts: all
+  become: true
+
+  vars:
+    package_names:
+      - openjdk-17-jdk
+      - nginx
+      - git
+      - curl
+
+  tasks:
+    - name: Install packages
+      ansible.builtin.apt:
+        name: "{{ package_names }}"
+        state: present
+        update_cache: true
