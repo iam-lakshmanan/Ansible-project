@@ -1,0 +1,571 @@
+---
+- name: Free up disk space and grow the root volume
+  hosts: all
+  become: true
+
+  vars:
+    # Set to true only if you have already resized the EBS volume in the AWS console
+    grow_root_volume: false
+    # Set to true to also delete unused Docker volumes (can delete data!)
+    prune_docker_volumes: false
+    # Minimum free space (GB) required on / after cleanup
+    min_free_gb: 5
+    journal_max_size: 100M
+
+  tasks:
+    # ---------- BEFORE ----------
+    - name: Show disk usage before cleanup
+      command: df -h /
+      register: df_before
+      changed_when: false
+
+    - name: Print disk usage before cleanup
+      debug:
+        var: df_before.stdout_lines
+
+    - name: Show biggest folders on /
+      shell: du -xh / --max-depth=2 2>/dev/null | sort -rh | head -15
+      register: du_top
+      changed_when: false
+
+    - name: Print biggest folders
+      debug:
+        var: du_top.stdout_lines
+
+    # ---------- DOCKER CLEANUP ----------
+    - name: Check if Docker is installed
+      command: which docker
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Show Docker disk usage
+      command: docker system df
+      register: docker_df
+      changed_when: false
+      when: docker_check.rc == 0
+
+    - name: Print Docker disk usage
+      debug:
+        var: docker_df.stdout_lines
+      when: docker_check.rc == 0
+
+    - name: Prune unused Docker images, containers, networks and build cache
+      command: docker system prune -af
+      register: docker_prune
+      changed_when: "'Total reclaimed space: 0B' not in docker_prune.stdout"
+      when: docker_check.rc == 0
+
+    - name: Prune unused Docker volumes (optional, destructive)
+      command: docker volume prune -f
+      when: docker_check.rc == 0 and prune_docker_volumes | bool
+
+    - name: Find Docker container logs larger than 100 MB
+      find:
+        paths: /var/lib/docker/containers
+        patterns: "*-json.log"
+        size: 100m
+        recurse: true
+      register: big_logs
+      when: docker_check.rc == 0
+
+    - name: Truncate large Docker container logs
+      shell: "truncate -s 0 {{ item.path }}"
+      loop: "{{ big_logs.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: docker_check.rc == 0
+
+    - name: Configure Docker log rotation
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" }
+          }
+        mode: "0644"
+      register: docker_daemon_json
+      when: docker_check.rc == 0
+
+    - name: Restart Docker to apply log rotation (only if config changed)
+      service:
+        name: docker
+        state: restarted
+      when: docker_check.rc == 0 and docker_daemon_json.changed
+
+    # ---------- SYSTEM CLEANUP ----------
+    - name: Clean APT cache
+      apt:
+        clean: true
+
+    - name: Remove unused packages
+      apt:
+        autoremove: true
+        purge: true
+
+    - name: Vacuum systemd journal logs
+      command: "journalctl --vacuum-size={{ journal_max_size }}"
+      changed_when: false
+
+    - name: Find old rotated logs
+      find:
+        paths: /var/log
+        patterns: "*.gz,*.1"
+        recurse: true
+      register: old_logs
+
+    - name: Delete old rotated logs
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_logs.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Remove old disabled snap revisions (if snap exists)
+      shell: |
+        snap list --all | awk '/disabled/{print $1, $3}' | while read name rev; do
+          snap remove "$name" --revision="$rev"
+        done
+      args:
+        executable: /bin/bash
+      register: snap_clean
+      changed_when: snap_clean.stdout != "" or snap_clean.stderr != ""
+      failed_when: false
+
+    # ---------- OPTIONAL: GROW VOLUME ----------
+    - name: Install growpart tool
+      apt:
+        name: cloud-guest-utils
+        state: present
+      when: grow_root_volume | bool
+
+    - name: Detect root partition and disk
+      shell: |
+        part=$(findmnt -n -o SOURCE /)
+        disk=/dev/$(lsblk -no PKNAME "$part")
+        num=$(cat /sys/class/block/$(basename "$part")/partition)
+        echo "$part $disk $num"
+      register: root_info
+      changed_when: false
+      when: grow_root_volume | bool
+
+    - name: Grow root partition
+      command: "growpart {{ root_info.stdout.split()[1] }} {{ root_info.stdout.split()[2] }}"
+      register: growpart_out
+      changed_when: "'CHANGED' in growpart_out.stdout"
+      failed_when: growpart_out.rc != 0 and 'NOCHANGE' not in growpart_out.stdout
+      when: grow_root_volume | bool
+
+    - name: Resize filesystem
+      shell: |
+        part={{ root_info.stdout.split()[0] }}
+        fstype=$(findmnt -n -o FSTYPE /)
+        if [ "$fstype" = "xfs" ]; then xfs_growfs /; else resize2fs "$part"; fi
+      changed_when: false
+      when: grow_root_volume | bool
+
+    # ---------- AFTER ----------
+    - name: Show disk usage after cleanup
+      command: df -h /
+      register: df_after
+      changed_when: false
+
+    - name: Print disk usage after cleanup
+      debug:
+        var: df_after.stdout_lines
+
+    - name: Re-gather mount facts
+      setup:
+        gather_subset:
+          - hardware
+
+    - name: Fail if there is still not enough free space
+      assert:
+        that:
+          - (ansible_facts['mounts'] | selectattr('mount', 'equalto', '/') | first).size_available > (min_free_gb | int) * 1024 * 1024 * 1024
+        fail_msg: >-
+          Less than {{ min_free_gb }} GB free on /.
+          Resize the EBS volume in AWS, then re-run with -e grow_root_volume=true
+        success_msg: "Enough free space on /. You can deploy the monitoring stack now."---
+- name: Free up disk space and grow the root volume
+  hosts: all
+  become: true
+
+  vars:
+    # Set to true only if you have already resized the EBS volume in the AWS console
+    grow_root_volume: false
+    # Set to true to also delete unused Docker volumes (can delete data!)
+    prune_docker_volumes: false
+    # Minimum free space (GB) required on / after cleanup
+    min_free_gb: 5
+    journal_max_size: 100M
+
+  tasks:
+    # ---------- BEFORE ----------
+    - name: Show disk usage before cleanup
+      command: df -h /
+      register: df_before
+      changed_when: false
+
+    - name: Print disk usage before cleanup
+      debug:
+        var: df_before.stdout_lines
+
+    - name: Show biggest folders on /
+      shell: du -xh / --max-depth=2 2>/dev/null | sort -rh | head -15
+      register: du_top
+      changed_when: false
+
+    - name: Print biggest folders
+      debug:
+        var: du_top.stdout_lines
+
+    # ---------- DOCKER CLEANUP ----------
+    - name: Check if Docker is installed
+      command: which docker
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Show Docker disk usage
+      command: docker system df
+      register: docker_df
+      changed_when: false
+      when: docker_check.rc == 0
+
+    - name: Print Docker disk usage
+      debug:
+        var: docker_df.stdout_lines
+      when: docker_check.rc == 0
+
+    - name: Prune unused Docker images, containers, networks and build cache
+      command: docker system prune -af
+      register: docker_prune
+      changed_when: "'Total reclaimed space: 0B' not in docker_prune.stdout"
+      when: docker_check.rc == 0
+
+    - name: Prune unused Docker volumes (optional, destructive)
+      command: docker volume prune -f
+      when: docker_check.rc == 0 and prune_docker_volumes | bool
+
+    - name: Find Docker container logs larger than 100 MB
+      find:
+        paths: /var/lib/docker/containers
+        patterns: "*-json.log"
+        size: 100m
+        recurse: true
+      register: big_logs
+      when: docker_check.rc == 0
+
+    - name: Truncate large Docker container logs
+      shell: "truncate -s 0 {{ item.path }}"
+      loop: "{{ big_logs.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: docker_check.rc == 0
+
+    - name: Configure Docker log rotation
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" }
+          }
+        mode: "0644"
+      register: docker_daemon_json
+      when: docker_check.rc == 0
+
+    - name: Restart Docker to apply log rotation (only if config changed)
+      service:
+        name: docker
+        state: restarted
+      when: docker_check.rc == 0 and docker_daemon_json.changed
+
+    # ---------- SYSTEM CLEANUP ----------
+    - name: Clean APT cache
+      apt:
+        clean: true
+
+    - name: Remove unused packages
+      apt:
+        autoremove: true
+        purge: true
+
+    - name: Vacuum systemd journal logs
+      command: "journalctl --vacuum-size={{ journal_max_size }}"
+      changed_when: false
+
+    - name: Find old rotated logs
+      find:
+        paths: /var/log
+        patterns: "*.gz,*.1"
+        recurse: true
+      register: old_logs
+
+    - name: Delete old rotated logs
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_logs.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Remove old disabled snap revisions (if snap exists)
+      shell: |
+        snap list --all | awk '/disabled/{print $1, $3}' | while read name rev; do
+          snap remove "$name" --revision="$rev"
+        done
+      args:
+        executable: /bin/bash
+      register: snap_clean
+      changed_when: snap_clean.stdout != "" or snap_clean.stderr != ""
+      failed_when: false
+
+    # ---------- OPTIONAL: GROW VOLUME ----------
+    - name: Install growpart tool
+      apt:
+        name: cloud-guest-utils
+        state: present
+      when: grow_root_volume | bool
+
+    - name: Detect root partition and disk
+      shell: |
+        part=$(findmnt -n -o SOURCE /)
+        disk=/dev/$(lsblk -no PKNAME "$part")
+        num=$(cat /sys/class/block/$(basename "$part")/partition)
+        echo "$part $disk $num"
+      register: root_info
+      changed_when: false
+      when: grow_root_volume | bool
+
+    - name: Grow root partition
+      command: "growpart {{ root_info.stdout.split()[1] }} {{ root_info.stdout.split()[2] }}"
+      register: growpart_out
+      changed_when: "'CHANGED' in growpart_out.stdout"
+      failed_when: growpart_out.rc != 0 and 'NOCHANGE' not in growpart_out.stdout
+      when: grow_root_volume | bool
+
+    - name: Resize filesystem
+      shell: |
+        part={{ root_info.stdout.split()[0] }}
+        fstype=$(findmnt -n -o FSTYPE /)
+        if [ "$fstype" = "xfs" ]; then xfs_growfs /; else resize2fs "$part"; fi
+      changed_when: false
+      when: grow_root_volume | bool
+
+    # ---------- AFTER ----------
+    - name: Show disk usage after cleanup
+      command: df -h /
+      register: df_after
+      changed_when: false
+
+    - name: Print disk usage after cleanup
+      debug:
+        var: df_after.stdout_lines
+
+    - name: Re-gather mount facts
+      setup:
+        gather_subset:
+          - hardware
+
+    - name: Fail if there is still not enough free space
+      assert:
+        that:
+          - (ansible_facts['mounts'] | selectattr('mount', 'equalto', '/') | first).size_available > (min_free_gb | int) * 1024 * 1024 * 1024
+        fail_msg: >-
+          Less than {{ min_free_gb }} GB free on /.
+          Resize the EBS volume in AWS, then re-run with -e grow_root_volume=true
+        success_msg: "Enough free space on /. You can deploy the monitoring stack now."---
+- name: Free up disk space and grow the root volume
+  hosts: all
+  become: true
+
+  vars:
+    # Set to true only if you have already resized the EBS volume in the AWS console
+    grow_root_volume: false
+    # Set to true to also delete unused Docker volumes (can delete data!)
+    prune_docker_volumes: false
+    # Minimum free space (GB) required on / after cleanup
+    min_free_gb: 5
+    journal_max_size: 100M
+
+  tasks:
+    # ---------- BEFORE ----------
+    - name: Show disk usage before cleanup
+      command: df -h /
+      register: df_before
+      changed_when: false
+
+    - name: Print disk usage before cleanup
+      debug:
+        var: df_before.stdout_lines
+
+    - name: Show biggest folders on /
+      shell: du -xh / --max-depth=2 2>/dev/null | sort -rh | head -15
+      register: du_top
+      changed_when: false
+
+    - name: Print biggest folders
+      debug:
+        var: du_top.stdout_lines
+
+    # ---------- DOCKER CLEANUP ----------
+    - name: Check if Docker is installed
+      command: which docker
+      register: docker_check
+      changed_when: false
+      failed_when: false
+
+    - name: Show Docker disk usage
+      command: docker system df
+      register: docker_df
+      changed_when: false
+      when: docker_check.rc == 0
+
+    - name: Print Docker disk usage
+      debug:
+        var: docker_df.stdout_lines
+      when: docker_check.rc == 0
+
+    - name: Prune unused Docker images, containers, networks and build cache
+      command: docker system prune -af
+      register: docker_prune
+      changed_when: "'Total reclaimed space: 0B' not in docker_prune.stdout"
+      when: docker_check.rc == 0
+
+    - name: Prune unused Docker volumes (optional, destructive)
+      command: docker volume prune -f
+      when: docker_check.rc == 0 and prune_docker_volumes | bool
+
+    - name: Find Docker container logs larger than 100 MB
+      find:
+        paths: /var/lib/docker/containers
+        patterns: "*-json.log"
+        size: 100m
+        recurse: true
+      register: big_logs
+      when: docker_check.rc == 0
+
+    - name: Truncate large Docker container logs
+      shell: "truncate -s 0 {{ item.path }}"
+      loop: "{{ big_logs.files | default([]) }}"
+      loop_control:
+        label: "{{ item.path }}"
+      when: docker_check.rc == 0
+
+    - name: Configure Docker log rotation
+      copy:
+        dest: /etc/docker/daemon.json
+        content: |
+          {
+            "log-driver": "json-file",
+            "log-opts": { "max-size": "10m", "max-file": "3" }
+          }
+        mode: "0644"
+      register: docker_daemon_json
+      when: docker_check.rc == 0
+
+    - name: Restart Docker to apply log rotation (only if config changed)
+      service:
+        name: docker
+        state: restarted
+      when: docker_check.rc == 0 and docker_daemon_json.changed
+
+    # ---------- SYSTEM CLEANUP ----------
+    - name: Clean APT cache
+      apt:
+        clean: true
+
+    - name: Remove unused packages
+      apt:
+        autoremove: true
+        purge: true
+
+    - name: Vacuum systemd journal logs
+      command: "journalctl --vacuum-size={{ journal_max_size }}"
+      changed_when: false
+
+    - name: Find old rotated logs
+      find:
+        paths: /var/log
+        patterns: "*.gz,*.1"
+        recurse: true
+      register: old_logs
+
+    - name: Delete old rotated logs
+      file:
+        path: "{{ item.path }}"
+        state: absent
+      loop: "{{ old_logs.files }}"
+      loop_control:
+        label: "{{ item.path }}"
+
+    - name: Remove old disabled snap revisions (if snap exists)
+      shell: |
+        snap list --all | awk '/disabled/{print $1, $3}' | while read name rev; do
+          snap remove "$name" --revision="$rev"
+        done
+      args:
+        executable: /bin/bash
+      register: snap_clean
+      changed_when: snap_clean.stdout != "" or snap_clean.stderr != ""
+      failed_when: false
+
+    # ---------- OPTIONAL: GROW VOLUME ----------
+    - name: Install growpart tool
+      apt:
+        name: cloud-guest-utils
+        state: present
+      when: grow_root_volume | bool
+
+    - name: Detect root partition and disk
+      shell: |
+        part=$(findmnt -n -o SOURCE /)
+        disk=/dev/$(lsblk -no PKNAME "$part")
+        num=$(cat /sys/class/block/$(basename "$part")/partition)
+        echo "$part $disk $num"
+      register: root_info
+      changed_when: false
+      when: grow_root_volume | bool
+
+    - name: Grow root partition
+      command: "growpart {{ root_info.stdout.split()[1] }} {{ root_info.stdout.split()[2] }}"
+      register: growpart_out
+      changed_when: "'CHANGED' in growpart_out.stdout"
+      failed_when: growpart_out.rc != 0 and 'NOCHANGE' not in growpart_out.stdout
+      when: grow_root_volume | bool
+
+    - name: Resize filesystem
+      shell: |
+        part={{ root_info.stdout.split()[0] }}
+        fstype=$(findmnt -n -o FSTYPE /)
+        if [ "$fstype" = "xfs" ]; then xfs_growfs /; else resize2fs "$part"; fi
+      changed_when: false
+      when: grow_root_volume | bool
+
+    # ---------- AFTER ----------
+    - name: Show disk usage after cleanup
+      command: df -h /
+      register: df_after
+      changed_when: false
+
+    - name: Print disk usage after cleanup
+      debug:
+        var: df_after.stdout_lines
+
+    - name: Re-gather mount facts
+      setup:
+        gather_subset:
+          - hardware
+
+    - name: Fail if there is still not enough free space
+      assert:
+        that:
+          - (ansible_facts['mounts'] | selectattr('mount', 'equalto', '/') | first).size_available > (min_free_gb | int) * 1024 * 1024 * 1024
+        fail_msg: >-
+          Less than {{ min_free_gb }} GB free on /.
+          Resize the EBS volume in AWS, then re-run with -e grow_root_volume=true
+        success_msg: "Enough free space on /. You can deploy the monitoring stack now."
