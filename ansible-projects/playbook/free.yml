@@ -3,6 +3,7 @@
 - name: Free statergy
   hosts: all
   become: true
+  strategy: free
 
   tasks:
     - name: Sleep
