@@ -1,0 +1,9 @@
+
+---
+- name: Free statergy
+  hosts: all
+  become: true
+
+  tasks:
+    - name: Sleep
+      shell: sleep 10
