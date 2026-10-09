@@ -1,0 +1,62 @@
+---
+- name: Monitoring stack deployment
+  hosts: all
+  become: true
+ 
+  tasks:
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+        update_cache: true
+ 
+    - name: Start Docker
+      service:
+        name: docker
+        state: started
+        enabled: true
+ 
+    - name: Add ubuntu to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: true
+ 
+    - name: Reset SSH connection
+      meta: reset_connection
+ 
+    - name: Install Docker Compose v1 binary
+      get_url:
+        url: "https://github.com/docker/compose/releases/download/1.29.2/docker-compose-Linux-x86_64"
+        dest: /usr/local/bin/docker-compose
+        mode: "0755"
+ 
+    - name: Create monitoring directories
+      file:
+        path: /opt/monitoring/prometheus
+        state: directory
+        recurse: true
+ 
+    - name: Copy Prometheus config
+      copy:
+        src: files/prometheus.yml
+        dest: /opt/monitoring/prometheus/prometheus.yml
+ 
+    - name: Copy Docker Compose file
+      copy:
+        src: files/docker-compose.yml
+        dest: /opt/monitoring/docker-compose.yml
+ 
+    - name: Start monitoring stack
+      shell: docker-compose up -d
+      args:
+        chdir: /opt/monitoring
+ 
+    - name: Verify containers
+      shell: docker ps
+      register: docker_output
+      changed_when: false
+ 
+    - name: Show containers
+      debug:
+        var: docker_output.stdout_lines

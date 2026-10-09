@@ -1,0 +1,55 @@
+---
+- name: Install Docker and run Jenkins
+  hosts: all
+  become: true
+ 
+  tasks:
+    - name: Install Docker
+      apt:
+        name: docker.io
+        state: present
+        update_cache: true
+ 
+    - name: Start Docker service
+      service:
+        name: docker
+        state: started
+        enabled: true
+ 
+    - name: Add ubuntu user to docker group
+      user:
+        name: ubuntu
+        groups: docker
+        append: true
+ 
+    - name: Reset SSH connection
+      meta: reset_connection
+ 
+    - name: Remove existing Jenkins container
+      shell: docker rm -f jenkins
+      ignore_errors: true
+      changed_when: false
+ 
+    - name: Run Jenkins container
+      shell: |
+        docker run -d \
+          --name jenkins \
+          --restart unless-stopped \
+          -p 8080:8080 \
+          -p 50000:50000 \
+          -v jenkins_home:/var/jenkins_home \
+          -v /var/run/docker.sock:/var/run/docker.sock \
+          -v /usr/bin/docker:/usr/bin/docker \
+          --user root \
+          jenkins/jenkins:lts
+      args:
+        creates: /var/lib/docker/containers # soft guard; prefer community.docker in prod
+ 
+    - name: Verify Jenkins container
+      shell: docker ps
+      register: docker_output
+      changed_when: false
+ 
+    - name: Display running containers
+      debug:
+        var: docker_output.stdout_lines
