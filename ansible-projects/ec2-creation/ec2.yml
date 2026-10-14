@@ -1,0 +1,36 @@
+---
+- name: Create EC2 instances (simple practice)
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  vars:
+    region: ap-southeast-1
+    key_name: managednode1                    
+    ami_id: ami-0532913178263be11       
+    servers:
+      - Server-1
+      - Server-2
+      - Server-3
+
+  tasks:
+    - name: Launch EC2 instances
+      amazon.aws.ec2_instance:
+        name: "{{ item }}"
+        region: "{{ region }}"
+        key_name: "{{ key_name }}"
+        instance_type: t3.micro          
+        image_id: "{{ ami_id }}"
+        volumes:
+          - device_name: /dev/sda1
+            ebs:
+              volume_size: 20
+        state: running
+        wait: true
+      loop: "{{ servers }}"
+      register: result
+
+    - name: Show public IPs
+      debug:
+        msg: "{{ item.item }} -> {{ item.instances[0].public_ip_address }}"
+      loop: "{{ result.results }}"
